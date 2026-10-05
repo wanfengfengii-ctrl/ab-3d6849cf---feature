@@ -6,9 +6,11 @@ Runs three stages and summarizes them in the process exit code:
   1. BUILD  - byte-compile every source file and import the ASGI app
   2. TESTS  - run the pytest suite (core math, validation, API)
   3. SMOKE  - black-box checks against the live HTTP API: shortest-arc
-              interpolation accuracy/continuity and rejection of
-              over-long sample gaps (plus zero-quaternion, 180-degree
-              ambiguity and non-increasing-time rejections)
+              interpolation accuracy/continuity, constant-angular-velocity
+              extrapolation inside extrapolation_limit_ns, and rejection
+              of over-long sample gaps (plus zero-quaternion, 180-degree
+              ambiguity, non-increasing-time, beyond-limit, over-long
+              support-gap and 180-degree-extrapolation rejections)
 
 Exit code is a bitmask so a single value summarizes every stage:
 
@@ -247,6 +249,77 @@ def check_smoke() -> bool:
     expect(400 <= status < 500 and detail.get("code") == "NON_INCREASING_SAMPLE_TIME"
            and detail.get("index") == 1,
            f"non-increasing sample times rejected with index (got {status} {detail})")
+
+    # -- 7. extrapolation: constant angular velocity beyond both ends ------
+    ext_payload = {
+        "samples": [
+            {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+            {"t": T0 + gap, "q": [SQRT2_2, 0.0, 0.0, SQRT2_2]},  # +90 deg about z
+        ],
+        "queries": [T0 - 5_000, T0 + 5_000, T0 + 15_000],
+        "max_gap_ns": gap,
+        "extrapolation_limit_ns": 5_000,
+    }
+    status, body = post_interpolate(ext_payload)
+    expect(status == 200, f"extrapolation request returns 200 (got {status})")
+    if status == 200:
+        attitudes = body.get("attitudes", [])
+        expect([a.get("t") for a in attitudes] == ext_payload["queries"],
+               "extrapolated results are returned in query order")
+        expected = [q_z(-math.pi / 4.0), q_z(math.pi / 4.0), q_z(3.0 * math.pi / 4.0)]
+        analytic_ok = len(attitudes) == len(expected) and all(
+            all(abs(a - e) <= 1e-9 for a, e in zip(entry["q"], want))
+            for entry, want in zip(attitudes, expected)
+        )
+        unit_ok = all(
+            abs(sum(c * c for c in entry["q"]) - 1.0) <= 1e-9
+            for entry in attitudes
+        )
+        expect(analytic_ok,
+               "head/tail extrapolation matches constant angular velocity within 1e-9")
+        expect(unit_ok, "extrapolated quaternions are unit norm within 1e-9")
+        if attitudes:
+            leading = next((c for c in attitudes[0]["q"] if c != 0.0), 1.0)
+            expect(leading > 0.0,
+                   "first extrapolated result's first non-zero component is positive")
+            dots_ok = all(
+                sum(x * y for x, y in zip(p["q"], c["q"])) >= 0.0
+                for p, c in zip(attitudes, attitudes[1:])
+            )
+            expect(dots_ok, "extrapolated sequence keeps non-negative dot product")
+
+    # -- 8. query beyond the extrapolation limit is rejected ----------------
+    beyond_payload = dict(ext_payload)
+    beyond_payload["queries"] = [T0 + 15_001]
+    status, body = post_interpolate(beyond_payload)
+    detail = body.get("detail", {})
+    expect(400 <= status < 500 and detail.get("code") == "QUERY_OUT_OF_RANGE"
+           and detail.get("index") == 0
+           and detail.get("extrapolation_limit_ns") == 5_000,
+           f"query beyond extrapolation limit rejected with index (got {status} {detail})")
+    expect("attitudes" not in body, "beyond-limit rejection yields no partial results")
+
+    # -- 9. extrapolation reaching 180 degrees is rejected ------------------
+    half_turn_payload = dict(ext_payload)
+    half_turn_payload["queries"] = [T0 - 20_000]  # 2 intervals * 90 deg = 180 deg
+    half_turn_payload["extrapolation_limit_ns"] = 20_000
+    status, body = post_interpolate(half_turn_payload)
+    detail = body.get("detail", {})
+    expect(400 <= status < 500
+           and detail.get("code") == "EXTRAPOLATION_180_DEGREE_ROTATION"
+           and detail.get("index") == 0,
+           f"180-degree extrapolation rejected with index (got {status} {detail})")
+
+    # -- 10. over-long extrapolation support interval is rejected -----------
+    support_gap_payload = dict(ext_payload)
+    support_gap_payload["queries"] = [T0 - 1_000]
+    support_gap_payload["extrapolation_limit_ns"] = 1_000
+    support_gap_payload["max_gap_ns"] = gap - 1
+    status, body = post_interpolate(support_gap_payload)
+    detail = body.get("detail", {})
+    expect(400 <= status < 500 and detail.get("code") == "SAMPLE_GAP_EXCEEDED"
+           and detail.get("index") == 0 and detail.get("sample_index") == 0,
+           f"over-long extrapolation support gap rejected (got {status} {detail})")
 
     if failures:
         print(f"SMOKE: FAIL ({len(failures)} check(s) failed)")

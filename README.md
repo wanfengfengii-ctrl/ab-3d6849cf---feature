@@ -55,11 +55,27 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python verify.py
 | 字段 | 约束 |
 |---|---|
 | `samples` | 2–2000 个样本；`t` 为纳秒整数时间戳，**严格递增**；`q` 为 4 个有限数（w, x, y, z），整体非零（按单位四元数解释，自动归一化） |
-| `queries` | 1–500 个纳秒整数时间戳，**严格递增**，落在 `[samples[0].t, samples[-1].t]` 闭区间内（可位于端点） |
-| `max_gap_ns` | 非负整数；每个查询的**包围样本间隔**不得超过该上限 |
+| `queries` | 1–500 个纳秒整数时间戳，**严格递增**，落在 `[samples[0].t, samples[-1].t]` 闭区间内（可位于端点）；启用 `extrapolation_limit_ns` 后可越界至 `[samples[0].t - limit, samples[-1].t + limit]` |
+| `max_gap_ns` | 非负整数；每个查询的**包围样本间隔**（外推时为**支撑间隔**）不得超过该上限 |
+| `extrapolation_limit_ns` | **可选**，非负整数，省略或为零表示关闭外推（语义与旧版完全一致）；开启后查询可越过首末样本各不超过该时限 |
 
 时间戳请使用 JSON 整数字面量（历元纳秒 ~1.7e18 超出 float64 精确整数
 范围 2^53，浮点字面量会被拒绝以避免静默舍入）。
+
+### 边界外推（`extrapolation_limit_ns` > 0）
+
+航摄任务偶尔会在惯导开始记录前或停止记录后触发少量曝光。开启外推后，
+越界查询按**恒角速度**补齐姿态：
+
+- 首端使用**最早两项**样本、末端使用**最后两项**样本的相对旋转与精确
+  纳秒间隔，沿对应端点的**最短旋转方向**外推；
+- 支撑间隔仍不得超过 `max_gap_ns`，否则以 `SAMPLE_GAP_EXCEEDED` 拒绝；
+- 单项外推旋转必须**严格小于 180°**，达到 180°（含超出）以
+  `EXTRAPOLATION_180_DEGREE_ROTATION` 拒绝；
+- 超出 `[首样本 - limit, 末样本 + limit]` 的查询以 `QUERY_OUT_OF_RANGE`
+  拒绝（错误体附带 `extrapolation_limit_ns`）；
+- 区间内查询继续沿用最短弧 SLERP 插值，外推帧与区间内帧共同构成
+  按查询顺序、符号连续的单位四元数序列。
 
 响应 `200`：
 
@@ -99,8 +115,9 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python verify.py
 `TIMESTAMP_PRECISION_LOSS`、`NON_FINITE_COMPONENT`、`ZERO_QUATERNION`、
 `NON_INCREASING_SAMPLE_TIME`、`NON_INCREASING_QUERY_TIME`、
 `AMBIGUOUS_180_DEGREE_ROTATION`（相邻旋转恰为 180°，最短弧不唯一）、
-`QUERY_OUT_OF_RANGE`、`NEGATIVE_MAX_GAP`、`SAMPLE_GAP_EXCEEDED`、
-`INVALID_JSON` / `INVALID_BODY`。
+`QUERY_OUT_OF_RANGE`、`NEGATIVE_MAX_GAP`、`NEGATIVE_EXTRAPOLATION_LIMIT`、
+`SAMPLE_GAP_EXCEEDED`、`EXTRAPOLATION_180_DEGREE_ROTATION`（外推旋转达到
+180°）、`INVALID_JSON` / `INVALID_BODY`。
 
 ### `GET /health`
 
@@ -116,6 +133,10 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python verify.py
   范围内插值误差 ~1e-15，远优于 1e-9 的交付容差。
 - 插值参数 `u = (t - t_i) / (t_{i+1} - t_i)` 由整数纳秒精确计算，
   历元级时间戳（~1.7e18 ns）不损失精度。
+- 外推支撑区间的 4D 夹角由弦长 `|q1 - q0| = 2·sin(ψ/2)` 求得，微小转角
+  在远距外推（外推因子放大角度误差）下仍保持 float64 精度；外推权重使用
+  闭式 `sin` 形式，对任意 `u` 精确。外推旋转角达到 180° − 2e-12 rad
+  （与样本 180° 判定阈值一致）即拒绝。
 
 ## 项目结构
 

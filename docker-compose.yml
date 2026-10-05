@@ -6,8 +6,9 @@
 #
 # `verify` is a one-shot service: it starts only after `app` passes its
 # health check, runs compile checks + the pytest suite + live API smoke
-# checks (interpolation accuracy/continuity and gap rejection), then exits
-# with a bitmask exit code summarizing the stages (0 = all passed).
+# checks (interpolation accuracy/continuity, boundary extrapolation and
+# gap rejection), then exits with a bitmask exit code summarizing the
+# stages (0 = all passed).
 
 services:
   app:

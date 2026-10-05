@@ -476,6 +476,251 @@ class TestQueryValidation:
 
 
 # ---------------------------------------------------------------------------
+# extrapolation beyond the sampled span (extrapolation_limit_ns)
+# ---------------------------------------------------------------------------
+
+class TestExtrapolation:
+    def payload(self, samples, queries, limit, max_gap_ns=10_000):
+        payload = make_payload(samples, queries, max_gap_ns)
+        payload["extrapolation_limit_ns"] = limit
+        return payload
+
+    def test_head_extrapolation_constant_angular_velocity(self):
+        # 90 deg per 10_000 ns; half an interval before the first sample
+        # must give -45 deg about the same axis.
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(math.pi / 2))]
+        result = interpolate_attitudes(self.payload(samples, [T0 - 5_000], 5_000))
+        assert_quat_close(result[0]["q"], q_z(-math.pi / 4))
+
+    def test_tail_extrapolation_constant_angular_velocity(self):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(math.pi / 2))]
+        result = interpolate_attitudes(self.payload(samples, [T0 + 15_000], 5_000))
+        assert_quat_close(result[0]["q"], q_z(3.0 * math.pi / 4))
+
+    def test_limit_boundary_is_inclusive(self):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(0.4))]
+        queries = [T0 - 5_000, T0 + 15_000]  # exactly the limit on both ends
+        result = interpolate_attitudes(self.payload(samples, queries, 5_000))
+        assert_quat_close(result[0]["q"], q_z(-0.2))
+        assert_quat_close(result[1]["q"], q_z(0.6))
+
+    def test_head_uses_first_two_samples_only(self):
+        # second interval rotates twice as fast; the head rate must come
+        # from the FIRST interval (0.5 rad per 10_000 ns)
+        samples = [
+            (T0, q_z(0.0)),
+            (T0 + 10_000, q_z(0.5)),
+            (T0 + 20_000, q_z(1.5)),
+        ]
+        result = interpolate_attitudes(self.payload(samples, [T0 - 10_000], 10_000))
+        assert_quat_close(result[0]["q"], q_z(-0.5))
+
+    def test_tail_uses_last_two_samples_only(self):
+        samples = [
+            (T0, q_z(0.0)),
+            (T0 + 10_000, q_z(0.5)),
+            (T0 + 20_000, q_z(1.5)),
+        ]
+        result = interpolate_attitudes(self.payload(samples, [T0 + 30_000], 10_000))
+        assert_quat_close(result[0]["q"], q_z(2.5))
+
+    def test_mixed_extrapolated_and_interpolated_queries_in_order(self):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(math.pi / 2))]
+        queries = [T0 - 5_000, T0 + 2_500, T0 + 5_000, T0 + 15_000]
+        result = interpolate_attitudes(self.payload(samples, queries, 5_000))
+        assert [entry["t"] for entry in result] == queries
+        expected = [q_z(-math.pi / 4), q_z(math.pi / 8),
+                    q_z(math.pi / 4), q_z(3.0 * math.pi / 4)]
+        for entry, want in zip(result, expected):
+            assert_quat_close(entry["q"], want)
+
+    def test_extrapolated_sequence_is_unit_and_sign_continuous(self):
+        angle = math.radians(100.0)
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(angle))]
+        queries = [T0 - 5_000 + 1_000 * k for k in range(21)]  # -0.5 .. +1.5 intervals
+        result = interpolate_attitudes(self.payload(samples, queries, 5_000))
+        quats = [entry["q"] for entry in result]
+        for q in quats:
+            assert abs(norm(q) - 1.0) <= 1e-9
+        leading = next(c for c in quats[0] if c != 0.0)
+        assert leading > 0.0
+        for previous, current in zip(quats, quats[1:]):
+            assert dot(previous, current) >= 0.0
+        # and the whole sequence tracks the analytic constant-rate sweep
+        for entry, k in zip(result, range(-5, 16)):
+            want = q_z(angle * k / 10.0)
+            assert dot(entry["q"], want) > 1.0 - 1e-15
+
+    def test_tiny_rotation_extrapolated_many_intervals(self):
+        # 1e-6 rad per interval, extrapolated 1000 intervals out: exercises
+        # the chord-based angle (acos would lose the tiny angle entirely)
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(1e-6))]
+        result = interpolate_attitudes(
+            self.payload(samples, [T0 - 10_000_000], 10_000_000)
+        )
+        assert_quat_close(result[0]["q"], q_z(-1e-3), tol=1e-12)
+
+    def test_sign_flipped_sample_extrapolates_along_shortest_arc(self):
+        samples = [
+            (T0, [1.0, 0.0, 0.0, 0.0]),
+            (T0 + 10_000, [-c for c in q_z(math.pi / 2)]),
+        ]
+        result = interpolate_attitudes(self.payload(samples, [T0 - 5_000], 5_000))
+        assert_quat_close(result[0]["q"], q_z(-math.pi / 4))
+
+    def test_non_unit_samples_are_normalized_before_extrapolation(self):
+        samples = [
+            (T0, [2.0, 0.0, 0.0, 0.0]),
+            (T0 + 10_000, [3.0 * SQRT2_2, 0.0, 0.0, 3.0 * SQRT2_2]),
+        ]
+        result = interpolate_attitudes(self.payload(samples, [T0 - 5_000], 5_000))
+        assert_quat_close(result[0]["q"], q_z(-math.pi / 4))
+
+    def test_identical_endpoint_samples_extrapolate_to_constant(self):
+        samples = [(T0, q_z(0.3)), (T0 + 10_000, q_z(0.3))]
+        result = interpolate_attitudes(self.payload(samples, [T0 - 5_000], 5_000))
+        assert_quat_close(result[0]["q"], q_z(0.3))
+
+    def test_float_integral_limit_accepted(self):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(0.4))]
+        result = interpolate_attitudes(self.payload(samples, [T0 - 5_000], 5_000.0))
+        assert_quat_close(result[0]["q"], q_z(-0.2))
+
+
+class TestExtrapolationValidation:
+    def payload(self, samples, queries, limit, max_gap_ns=10_000):
+        payload = make_payload(samples, queries, max_gap_ns)
+        payload["extrapolation_limit_ns"] = limit
+        return payload
+
+    def test_zero_limit_matches_omitted_semantics(self):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10, [1.0, 0.0, 0.0, 0.0])]
+        with pytest.raises(AttitudeInputError) as omitted:
+            interpolate_attitudes(make_payload(samples, [T0 - 1]))
+        with pytest.raises(AttitudeInputError) as explicit_zero:
+            interpolate_attitudes(self.payload(samples, [T0 - 1], 0))
+        assert explicit_zero.value.to_payload() == omitted.value.to_payload()
+        assert omitted.value.code == "QUERY_OUT_OF_RANGE"
+
+    def test_negative_limit_rejected(self):
+        payload = self.payload(
+            [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 1, [1.0, 0.0, 0.0, 0.0])], [T0], -1
+        )
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "NEGATIVE_EXTRAPOLATION_LIMIT"
+        assert err.path == "extrapolation_limit_ns"
+
+    @pytest.mark.parametrize("bad", [1.5, True, None, "5000"])
+    def test_non_integer_limit_rejected(self, bad):
+        payload = self.payload(
+            [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 1, [1.0, 0.0, 0.0, 0.0])], [T0], bad
+        )
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code in {"NON_INTEGER_TIMESTAMP", "INVALID_TYPE"}
+        assert excinfo.value.path == "extrapolation_limit_ns"
+
+    def test_imprecise_float_limit_rejected(self):
+        payload = self.payload(
+            [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 1, [1.0, 0.0, 0.0, 0.0])], [T0], 1.7e18
+        )
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "TIMESTAMP_PRECISION_LOSS"
+
+    @pytest.mark.parametrize(
+        "offsets,expected_index",
+        [((-5_001, 5_000), 0), ((5_000, 15_001), 1)],
+    )
+    def test_query_beyond_limit_rejected_with_index(self, offsets, expected_index):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(0.4))]
+        queries = [T0 + offset for offset in offsets]
+        payload = self.payload(samples, queries, 5_000)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "QUERY_OUT_OF_RANGE"
+        # the in-span companion query does not save the request
+        assert err.index == expected_index
+        assert err.context["extrapolation_limit_ns"] == 5_000
+        assert err.context["sample_start"] == T0
+        assert err.context["sample_end"] == T0 + 10_000
+
+    def test_head_support_gap_exceeding_max_gap_rejected(self):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(0.4))]
+        payload = self.payload(samples, [T0 - 1_000], 1_000, max_gap_ns=9_999)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "SAMPLE_GAP_EXCEEDED"
+        assert err.index == 0
+        assert err.context["sample_index"] == 0
+        assert err.context["gap_ns"] == 10_000
+
+    def test_tail_support_gap_exceeding_max_gap_rejected(self):
+        samples = [
+            (T0, q_z(0.0)),
+            (T0 + 100, q_z(0.1)),
+            (T0 + 10_100, q_z(0.2)),
+        ]
+        payload = self.payload(samples, [T0 + 10_150], 100, max_gap_ns=100)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "SAMPLE_GAP_EXCEEDED"
+        assert err.index == 0
+        assert err.context["sample_index"] == 1
+        assert err.context["interval"] == [T0 + 100, T0 + 10_100]
+
+    def test_extrapolation_reaching_180_degrees_rejected(self):
+        # 90 deg per interval; two intervals back lands exactly on 180 deg
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(math.pi / 2))]
+        payload = self.payload(samples, [T0 - 20_000], 20_000)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "EXTRAPOLATION_180_DEGREE_ROTATION"
+        assert err.index == 0
+        assert err.path == "queries[0]"
+        assert err.context["sample_index"] == 0
+
+    def test_extrapolation_beyond_180_degrees_rejected(self):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(math.pi / 2))]
+        payload = self.payload(samples, [T0 + 35_000], 25_000)  # 225 deg past the end
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "EXTRAPOLATION_180_DEGREE_ROTATION"
+        assert err.index == 0
+        assert err.context["sample_index"] == 0  # two samples: head == tail interval
+
+    def test_extrapolation_just_under_180_degrees_accepted(self):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(math.pi / 2))]
+        # 19_999 ns back = 179.991 degrees of extrapolated rotation
+        result = interpolate_attitudes(self.payload(samples, [T0 - 19_999], 19_999))
+        assert_quat_close(result[0]["q"], q_z(-1.9999 * math.pi / 2), tol=1e-9)
+
+    def test_in_span_gap_rule_unchanged_when_limit_enabled(self):
+        # an in-span query over an over-long gap is still rejected even
+        # though extrapolation is enabled
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(0.4))]
+        payload = self.payload(samples, [T0 + 5_000], 5_000, max_gap_ns=9_999)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "SAMPLE_GAP_EXCEEDED"
+
+    def test_no_partial_results_on_extrapolation_failure(self):
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10_000, q_z(0.4))]
+        payload = self.payload(samples, [T0 + 5_000, T0 + 15_001], 5_000)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "QUERY_OUT_OF_RANGE"
+        assert excinfo.value.index == 1
+
+
+# ---------------------------------------------------------------------------
 # validation: envelope
 # ---------------------------------------------------------------------------
 

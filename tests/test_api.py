@@ -166,3 +166,92 @@ class TestErrorResponses:
     def test_get_on_interpolate_not_allowed(self):
         response = client.get("/api/attitudes/interpolate")
         assert 400 <= response.status_code < 500
+
+
+class TestExtrapolationApi:
+    def test_head_and_tail_extrapolation(self):
+        payload = valid_payload(
+            queries=[T0 - 5_000, T0 + 5_000, T0 + 15_000],
+            extrapolation_limit_ns=5_000,
+        )
+        response = post(payload)
+        assert response.status_code == 200
+        attitudes = response.json()["attitudes"]
+        assert [a["t"] for a in attitudes] == payload["queries"]
+        # samples sweep +90 deg about z per 10_000 ns
+        expected = [
+            [math.cos(-math.pi / 8), 0.0, 0.0, math.sin(-math.pi / 8)],
+            [math.cos(math.pi / 8), 0.0, 0.0, math.sin(math.pi / 8)],
+            [math.cos(3.0 * math.pi / 8), 0.0, 0.0, math.sin(3.0 * math.pi / 8)],
+        ]
+        for entry, want in zip(attitudes, expected):
+            for actual, expected_component in zip(entry["q"], want):
+                assert abs(actual - expected_component) <= 1e-9
+
+    def test_extrapolated_sequence_is_unit_and_sign_continuous(self):
+        payload = valid_payload(
+            queries=[T0 - 5_000 + 1_000 * k for k in range(21)],
+            extrapolation_limit_ns=5_000,
+        )
+        response = post(payload)
+        assert response.status_code == 200
+        quats = [a["q"] for a in response.json()["attitudes"]]
+        for q in quats:
+            assert abs(sum(c * c for c in q) - 1.0) <= 1e-9
+        leading = next(c for c in quats[0] if c != 0.0)
+        assert leading > 0.0
+        for previous, current in zip(quats, quats[1:]):
+            assert sum(a * b for a, b in zip(previous, current)) >= 0.0
+
+    def test_query_beyond_limit_is_400_with_index(self):
+        payload = valid_payload(
+            queries=[T0 + 5_000, T0 + 15_001], extrapolation_limit_ns=5_000
+        )
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "QUERY_OUT_OF_RANGE"
+        assert detail["index"] == 1
+        assert detail["extrapolation_limit_ns"] == 5_000
+        assert "attitudes" not in response.json()
+
+    def test_zero_limit_keeps_legacy_out_of_range_error(self):
+        payload = valid_payload(queries=[T0 + 20_000], extrapolation_limit_ns=0)
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "QUERY_OUT_OF_RANGE"
+        assert "extrapolation_limit_ns" not in detail
+
+    def test_negative_limit_is_400(self):
+        payload = valid_payload(extrapolation_limit_ns=-1)
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "NEGATIVE_EXTRAPOLATION_LIMIT"
+        assert detail["path"] == "extrapolation_limit_ns"
+
+    def test_extrapolation_reaching_180_degrees_is_400(self):
+        payload = valid_payload(
+            queries=[T0 - 20_000], extrapolation_limit_ns=20_000
+        )
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "EXTRAPOLATION_180_DEGREE_ROTATION"
+        assert detail["index"] == 0
+        assert detail["path"] == "queries[0]"
+
+    def test_over_long_support_interval_is_400(self):
+        payload = valid_payload(
+            queries=[T0 - 1_000],
+            max_gap_ns=5_000,
+            extrapolation_limit_ns=1_000,
+        )
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "SAMPLE_GAP_EXCEEDED"
+        assert detail["index"] == 0
+        assert detail["sample_index"] == 0
+        assert detail["gap_ns"] == 10_000
