@@ -8,7 +8,10 @@ Runs three stages and summarizes them in the process exit code:
   3. SMOKE  - black-box checks against the live HTTP API: shortest-arc
               interpolation accuracy/continuity and rejection of
               over-long sample gaps (plus zero-quaternion, 180-degree
-              ambiguity and non-increasing-time rejections)
+              ambiguity and non-increasing-time rejections), and the
+              optional constant-velocity endpoint extrapolation
+              (boundary-frame accuracy/continuity, limit, support-gap and
+              180-degree rejections)
 
 Exit code is a bitmask so a single value summarizes every stage:
 
@@ -247,6 +250,111 @@ def check_smoke() -> bool:
     expect(400 <= status < 500 and detail.get("code") == "NON_INCREASING_SAMPLE_TIME"
            and detail.get("index") == 1,
            f"non-increasing sample times rejected with index (got {status} {detail})")
+
+    # -- 7. endpoint extrapolation: boundary frames + continuity -----------
+    extrap_gap = 10_000
+    extrap_queries = [T0 + q for q in (-5_000, 0, 5_000, 10_000, 15_000)]
+    extrap_payload = {
+        "samples": [
+            {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+            {"t": T0 + extrap_gap, "q": [SQRT2_2, 0.0, 0.0, SQRT2_2]},  # +90 deg about z
+        ],
+        "queries": extrap_queries,
+        "max_gap_ns": extrap_gap,
+        "extrapolation_limit_ns": 5_000,
+    }
+    status, body = post_interpolate(extrap_payload)
+    expect(status == 200, f"in-range extrapolation request returns 200 (got {status})")
+    if status == 200:
+        attitudes = body.get("attitudes", [])
+        expect([a.get("t") for a in attitudes] == extrap_queries,
+               "extrapolated attitudes are returned in query order")
+        # constant angular velocity: +90 deg / 10000 ns about z, so the
+        # two boundary frames land at -45 deg and +135 deg
+        analytic = (
+            q_z(-math.pi / 4.0), q_z(0.0), q_z(math.pi / 4.0),
+            q_z(math.pi / 2.0), q_z(3.0 * math.pi / 4.0),
+        )
+        analytic_ok = True
+        for entry, want in zip(attitudes, analytic):
+            q = entry["q"]
+            same_sign = all(abs(a - e) <= 1e-9 for a, e in zip(q, want))
+            flipped_sign = all(abs(a + e) <= 1e-9 for a, e in zip(q, want))
+            if not (same_sign or flipped_sign):
+                analytic_ok = False
+        expect(analytic_ok,
+               "extrapolated boundary frames match constant-velocity slerp within 1e-9")
+        quats = [a["q"] for a in attitudes]
+        unit_ok = all(abs(sum(c * c for c in q) - 1.0) <= 1e-9 for q in quats)
+        expect(unit_ok, "extrapolated quaternions are unit norm within 1e-9")
+        leading = next((c for c in quats[0] if c != 0.0), 1.0)
+        dots_ok = (
+            leading > 0.0
+            and all(sum(x * y for x, y in zip(p, c)) >= 0.0
+                    for p, c in zip(quats, quats[1:]))
+        )
+        expect(dots_ok, "boundary and interior frames form one sign-continuous sequence")
+
+    # exactly one limit away is accepted; one nanosecond beyond is rejected
+    status_ok, _ = post_interpolate({**extrap_payload, "queries": [T0 + 15_000]})
+    status_bad, body_bad = post_interpolate({
+        **extrap_payload, "queries": [T0 + 15_001]})
+    detail_bad = body_bad.get("detail", {})
+    expect(status_ok == 200 and 400 <= status_bad < 500
+           and detail_bad.get("code") == "QUERY_OUT_OF_RANGE"
+           and detail_bad.get("index") == 0
+           and detail_bad.get("extrapolation_ns") == 5_001
+           and detail_bad.get("extrapolation_limit_ns") == 5_000,
+           f"extrapolation limit is inclusive and overflow is locatable "
+           f"(got {status_ok}/{status_bad} {detail_bad})")
+
+    # extrapolation over an over-long endpoint support gap is rejected
+    long_gap_payload = {
+        "samples": [
+            {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+            {"t": T0 + 100_000, "q": [1.0, 0.0, 0.0, 0.0]},
+        ],
+        "queries": [T0 - 1],
+        "max_gap_ns": 10_000,
+        "extrapolation_limit_ns": 10_000,
+    }
+    status, body = post_interpolate(long_gap_payload)
+    detail = body.get("detail", {})
+    expect(400 <= status < 500 and detail.get("code") == "SAMPLE_GAP_EXCEEDED"
+           and detail.get("index") == 0
+           and detail.get("sample_index") == 0
+           and detail.get("side") == "before",
+           f"over-long extrapolation support gap rejected (got {status} {detail})")
+
+    # an extrapolated sweep reaching 180 degrees is rejected as a whole
+    sweep_payload = {
+        "samples": [
+            {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+            {"t": T0 + 10_000, "q": [SQRT2_2, 0.0, 0.0, SQRT2_2]},  # +90 deg
+        ],
+        "queries": [T0 - 20_000],  # twice the support gap back -> 180 deg
+        "max_gap_ns": 10_000,
+        "extrapolation_limit_ns": 100_000,
+    }
+    status, body = post_interpolate(sweep_payload)
+    detail = body.get("detail", {})
+    expect(400 <= status < 500
+           and detail.get("code") == "EXTRAPOLATION_180_DEGREE_ROTATION"
+           and detail.get("index") == 0,
+           f"180-degree extrapolation sweep rejected with query index "
+           f"(got {status} {detail})")
+
+    # omitting the field preserves the original out-of-range rejection
+    status, body = post_interpolate({
+        "samples": extrap_payload["samples"],
+        "queries": [T0 - 1],
+        "max_gap_ns": extrap_gap,
+    })
+    detail = body.get("detail", {})
+    expect(400 <= status < 500 and detail.get("code") == "QUERY_OUT_OF_RANGE"
+           and "extrapolation_ns" not in detail,
+           f"omitted extrapolation_limit_ns preserves error semantics "
+           f"(got {status} {detail})")
 
     if failures:
         print(f"SMOKE: FAIL ({len(failures)} check(s) failed)")

@@ -38,6 +38,12 @@ _SAFE_INTEGER_FLOAT = 2 ** 53
 # meaningfully use (179.9999999 deg corresponds to |dot| ~ 8.7e-10).
 _AMBIGUOUS_DOT_THRESHOLD = 1e-12
 
+# An extrapolation rotation is rejected once it reaches 180 degrees.  The
+# dot-product threshold above corresponds to an angular margin of twice
+# that value in radians (cos(pi/2 - eps) ~= eps), so the direct
+# angle comparison uses the same parity of tolerance.
+_EXTRAPOLATION_180_ANGLE_EPS = 2.0 * _AMBIGUOUS_DOT_THRESHOLD
+
 # Dot products above this use the small-angle series for slerp weights,
 # avoiding cancellation in acos/sin for nearly identical attitudes.
 _SMALL_ANGLE_DOT = 1.0 - 1e-9
@@ -196,6 +202,126 @@ def _slerp(q0: List[float], q1: List[float], u: float) -> List[float]:
     return _normalize(result)
 
 
+def _slerp_extrapolate(
+    q0: List[float],
+    q1: List[float],
+    *,
+    support_t0: int,
+    support_t1: int,
+    support_index: int,
+    beyond: int,
+    side: str,
+    sample_start: int,
+    sample_end: int,
+    query_index: int,
+    t: int,
+    max_gap: int,
+) -> List[float]:
+    """Constant-angular-velocity extrapolation past an endpoint.
+
+    ``q0``/``q1`` are the two (sign-aligned) samples nearest the endpoint
+    (the first two samples when ``side`` is ``"before"`` and the last two
+    when it is ``"after"``); ``support_t0``/``support_t1`` are their exact
+    nanosecond timestamps and ``support_index`` the index of ``q0``.
+    ``beyond`` is the query's non-negative distance past that endpoint.
+    Raises :class:`AttitudeInputError` locatable by ``query_index`` if the
+    support gap exceeds ``max_gap`` or the resulting rotation reaches
+    180 degrees.
+    """
+    dt = support_t1 - support_t0
+
+    def error(code: str, message: str, **context: Any) -> AttitudeInputError:
+        return AttitudeInputError(
+            code,
+            message,
+            index=query_index,
+            path=f"queries[{query_index}]",
+            context=context,
+        )
+
+    if dt > max_gap:
+        raise error(
+            "SAMPLE_GAP_EXCEEDED",
+            f"queries[{query_index}]={t} lies {beyond} ns {side} the "
+            f"sampled interval [{sample_start}, {sample_end}]; its "
+            f"extrapolation is supported by samples[{support_index}] "
+            f"(t={support_t0}) and samples[{support_index + 1}] "
+            f"(t={support_t1}) whose gap {dt} ns exceeds "
+            f"max_gap_ns={max_gap}",
+            side=side,
+            sample_index=support_index,
+            interval=[support_t0, support_t1],
+            gap_ns=dt,
+            max_gap_ns=max_gap,
+            extrapolation_ns=beyond,
+            sample_start=sample_start,
+            sample_end=sample_end,
+        )
+
+    d = _dot(q0, q1)
+    if d > 1.0:  # clamp float rounding on (nearly) identical quaternions
+        d = 1.0
+
+    # Relative rotation r = q0^{-1} * q1 between the two support samples.
+    # The samples are sign-aligned upstream, so r has a non-negative scalar
+    # part and its angle theta lies on the shortest arc ([0, pi/2)); pairs
+    # at 180 degrees are rejected during sample validation.
+    w0, x0, y0, z0 = q0
+    w1, x1, y1, z1 = q1
+    rv = [
+        w0 * x1 - x0 * w1 - y0 * z1 + z0 * y1,
+        w0 * y1 + x0 * z1 - y0 * w1 - z0 * x1,
+        w0 * z1 - x0 * y1 + y0 * x1 - z0 * w1,
+    ]
+    sin_theta = math.hypot(rv[0], rv[1], rv[2])
+    theta = math.atan2(sin_theta, d)
+
+    # The extrapolation rotation is the physical rotation *from the endpoint
+    # sample* to the queried attitude: 2 * theta * beyond / dt at either
+    # end.  Its quaternion half-angle is theta * scale and must stay
+    # strictly below pi/2, i.e. the physical rotation stays below 180 deg.
+    scale = beyond / dt
+    half_angle = theta * scale
+    if half_angle >= math.pi / 2.0 - _EXTRAPOLATION_180_ANGLE_EPS:
+        raise error(
+            "EXTRAPOLATION_180_DEGREE_ROTATION",
+            f"queries[{query_index}]={t} lies {beyond} ns {side} the "
+            f"sampled interval [{sample_start}, {sample_end}]; constant "
+            f"angular velocity would rotate by "
+            f"{math.degrees(2.0 * half_angle):.6f} degrees from the "
+            f"endpoint there, which is not strictly less than 180 degrees",
+            side=side,
+            rotation_degrees=math.degrees(2.0 * half_angle),
+            support_gap_ns=dt,
+            extrapolation_ns=beyond,
+            sample_start=sample_start,
+            sample_end=sample_end,
+        )
+
+    if sin_theta == 0.0:  # identical support attitudes: no angular velocity
+        return list(q0)
+
+    # Constant angular velocity along the endpoint's shortest-arc great
+    # circle: q(t) = q0 * r**u with u = -scale (before the first sample)
+    # or u = 1 + scale (after the last sample).  The power is built from
+    # the relative rotation's own vector part, which stays accurate for
+    # tiny support angles and very long extrapolation parameters.  u is
+    # never inside (0, 1), so phi never subtracts from theta and direct
+    # trigonometry needs no small-angle series.
+    u = -scale if side == "before" else 1.0 + scale
+    phi = u * theta
+    factor = math.sin(phi) / sin_theta
+    sx, sy, sz = (factor * c for c in rv)
+    c_phi = math.cos(phi)
+    result = [
+        w0 * c_phi - x0 * sx - y0 * sy - z0 * sz,
+        w0 * sx + x0 * c_phi + y0 * sz - z0 * sy,
+        w0 * sy - x0 * sz + y0 * c_phi + z0 * sx,
+        w0 * sz + x0 * sy - y0 * sx + z0 * c_phi,
+    ]
+    return _normalize(result)
+
+
 def _apply_output_sign_convention(quats: List[List[float]]) -> None:
     """Re-sign results in place for a continuous exposure sequence.
 
@@ -342,6 +468,19 @@ def _validate_max_gap(raw_max_gap: Any) -> int:
     return max_gap
 
 
+def _validate_extrapolation_limit(payload: Dict[str, Any]) -> int:
+    """Parse the optional extrapolation_limit_ns (absent/0 disables it)."""
+    raw = payload.get("extrapolation_limit_ns", 0)
+    limit = _require_int_ns(raw, "extrapolation_limit_ns")
+    if limit < 0:
+        raise AttitudeInputError(
+            "NEGATIVE_EXTRAPOLATION_LIMIT",
+            f"extrapolation_limit_ns must be non-negative, got {limit}",
+            path="extrapolation_limit_ns",
+        )
+    return limit
+
+
 def interpolate_attitudes(payload: Any) -> List[Dict[str, Any]]:
     """Validate the request and interpolate attitudes at the query times.
 
@@ -360,21 +499,87 @@ def interpolate_attitudes(payload: Any) -> List[Dict[str, Any]]:
     times, quats = _validate_samples(_require_field(payload, "samples", "samples", None))
     query_times = _validate_queries(_require_field(payload, "queries", "queries", None))
     max_gap = _validate_max_gap(_require_field(payload, "max_gap_ns", "max_gap_ns", None))
+    extrapolation_limit = _validate_extrapolation_limit(payload)
 
     first_t, last_t = times[0], times[-1]
     last_interval = len(times) - 2
 
     results: List[Dict[str, Any]] = []
     for query_index, t in enumerate(query_times):
-        if t < first_t or t > last_t:
-            raise AttitudeInputError(
-                "QUERY_OUT_OF_RANGE",
-                f"queries[{query_index}]={t} lies outside the sampled "
-                f"interval [{first_t}, {last_t}]",
-                index=query_index,
-                path=f"queries[{query_index}]",
-                context={"sample_start": first_t, "sample_end": last_t},
+        if t < first_t:
+            beyond = first_t - t
+            if extrapolation_limit == 0:
+                # Extrapolation disabled (field omitted or zero): keep the
+                # original error message and payload verbatim.
+                raise AttitudeInputError(
+                    "QUERY_OUT_OF_RANGE",
+                    f"queries[{query_index}]={t} lies outside the sampled "
+                    f"interval [{first_t}, {last_t}]",
+                    index=query_index,
+                    path=f"queries[{query_index}]",
+                    context={"sample_start": first_t, "sample_end": last_t},
+                )
+            if beyond > extrapolation_limit:
+                raise AttitudeInputError(
+                    "QUERY_OUT_OF_RANGE",
+                    f"queries[{query_index}]={t} lies {beyond} ns before the "
+                    f"sampled interval [{first_t}, {last_t}]; "
+                    f"extrapolation_limit_ns={extrapolation_limit}",
+                    index=query_index,
+                    path=f"queries[{query_index}]",
+                    context={
+                        "sample_start": first_t,
+                        "sample_end": last_t,
+                        "extrapolation_ns": beyond,
+                        "extrapolation_limit_ns": extrapolation_limit,
+                    },
+                )
+            q = _slerp_extrapolate(
+                quats[0], quats[1],
+                support_t0=times[0], support_t1=times[1],
+                support_index=0,
+                beyond=beyond, side="before",
+                sample_start=first_t, sample_end=last_t,
+                query_index=query_index, t=t, max_gap=max_gap,
             )
+            results.append({"t": t, "q": q})
+            continue
+        if t > last_t:
+            beyond = t - last_t
+            if extrapolation_limit == 0:
+                raise AttitudeInputError(
+                    "QUERY_OUT_OF_RANGE",
+                    f"queries[{query_index}]={t} lies outside the sampled "
+                    f"interval [{first_t}, {last_t}]",
+                    index=query_index,
+                    path=f"queries[{query_index}]",
+                    context={"sample_start": first_t, "sample_end": last_t},
+                )
+            if beyond > extrapolation_limit:
+                raise AttitudeInputError(
+                    "QUERY_OUT_OF_RANGE",
+                    f"queries[{query_index}]={t} lies {beyond} ns after the "
+                    f"sampled interval [{first_t}, {last_t}]; "
+                    f"extrapolation_limit_ns={extrapolation_limit}",
+                    index=query_index,
+                    path=f"queries[{query_index}]",
+                    context={
+                        "sample_start": first_t,
+                        "sample_end": last_t,
+                        "extrapolation_ns": beyond,
+                        "extrapolation_limit_ns": extrapolation_limit,
+                    },
+                )
+            q = _slerp_extrapolate(
+                quats[-2], quats[-1],
+                support_t0=times[-2], support_t1=times[-1],
+                support_index=len(times) - 2,
+                beyond=beyond, side="after",
+                sample_start=first_t, sample_end=last_t,
+                query_index=query_index, t=t, max_gap=max_gap,
+            )
+            results.append({"t": t, "q": q})
+            continue
         i = bisect_right(times, t) - 1
         if i > last_interval:  # query exactly at the final sample
             i = last_interval

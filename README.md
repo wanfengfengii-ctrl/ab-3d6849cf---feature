@@ -48,18 +48,34 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python verify.py
     {"t": 1700000000000010000, "q": [0.7071067811865476, 0.0, 0.0, 0.7071067811865476]}
   ],
   "queries": [1700000000000002500, 1700000000000005000, 1700000000000007500],
-  "max_gap_ns": 10000
+  "max_gap_ns": 10000,
+  "extrapolation_limit_ns": 0
 }
 ```
 
 | 字段 | 约束 |
 |---|---|
 | `samples` | 2–2000 个样本；`t` 为纳秒整数时间戳，**严格递增**；`q` 为 4 个有限数（w, x, y, z），整体非零（按单位四元数解释，自动归一化） |
-| `queries` | 1–500 个纳秒整数时间戳，**严格递增**，落在 `[samples[0].t, samples[-1].t]` 闭区间内（可位于端点） |
-| `max_gap_ns` | 非负整数；每个查询的**包围样本间隔**不得超过该上限 |
+| `queries` | 1–500 个纳秒整数时间戳，**严格递增**；默认须落在 `[samples[0].t, samples[-1].t]` 闭区间内（可位于端点）。启用外推后，可越过首/末样本各不超过 `extrapolation_limit_ns` 纳秒 |
+| `max_gap_ns` | 非负整数；每个查询的**包围样本间隔**（外推时为首/末两项支撑样本的间隔）不得超过该上限 |
+| `extrapolation_limit_ns` | 可选，非负整数；**省略或为 0 时行为与旧版完全一致**（区间外查询仍以 `QUERY_OUT_OF_RANGE` 拒绝）。为正时，首端取最早两项、末端取最后两项样本的**相对旋转与精确纳秒间隔**作**恒角速度外推**，查询越过端点的距离不得超过该值 |
 
 时间戳请使用 JSON 整数字面量（历元纳秒 ~1.7e18 超出 float64 精确整数
 范围 2^53，浮点字面量会被拒绝以避免静默舍入）。
+
+**外推约定**（仅 `extrapolation_limit_ns > 0` 时）：
+
+- 外推沿对应端点相邻样本的**最短旋转方向**继续，等价于在首/末两项
+  确定的大圆上延长 SLERP（首端参数 < 0，末端参数 > 1）。
+- 支撑样本的间隔仍须满足 `max_gap_ns`，否则以 `SAMPLE_GAP_EXCEEDED`
+  整体拒绝（错误索引为触发的 query 索引，`side` 标明 `before`/`after`）。
+- 从端点样本到外推姿态的旋转必须**严格小于 180°**；达到 180° 时以
+  `EXTRAPOLATION_180_DEGREE_ROTATION` 拒绝（样本对本身为 180° 仍按
+  既有 `AMBIGUOUS_180_DEGREE_ROTATION` 在样本校验阶段拒绝）。
+- 越过端点超过 `extrapolation_limit_ns`（限界本身闭区间、恰好等于时接受）
+  以可定位 query 索引的 `QUERY_OUT_OF_RANGE` 拒绝。
+- 任一 query 失败则整架次请求 4xx，不产生部分结果；外推帧与区间内帧
+  共用同一套单位化与整列符号连续约定，形成可复核的连续姿态序列。
 
 响应 `200`：
 
@@ -99,8 +115,13 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python verify.py
 `TIMESTAMP_PRECISION_LOSS`、`NON_FINITE_COMPONENT`、`ZERO_QUATERNION`、
 `NON_INCREASING_SAMPLE_TIME`、`NON_INCREASING_QUERY_TIME`、
 `AMBIGUOUS_180_DEGREE_ROTATION`（相邻旋转恰为 180°，最短弧不唯一）、
-`QUERY_OUT_OF_RANGE`、`NEGATIVE_MAX_GAP`、`SAMPLE_GAP_EXCEEDED`、
+`QUERY_OUT_OF_RANGE`（含越过 `extrapolation_limit_ns`）、`NEGATIVE_MAX_GAP`、
+`SAMPLE_GAP_EXCEEDED`（含外推支撑间隔过长）、`NEGATIVE_EXTRAPOLATION_LIMIT`、
+`EXTRAPOLATION_180_DEGREE_ROTATION`（外推旋转达到 180°）、
 `INVALID_JSON` / `INVALID_BODY`。
+
+> 注：省略 `extrapolation_limit_ns`（或传 0）时，`QUERY_OUT_OF_RANGE`
+> 的消息与负载与旧版逐字一致——不含任何外推上下文字段。
 
 ### `GET /health`
 
@@ -116,6 +137,11 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python verify.py
   范围内插值误差 ~1e-15，远优于 1e-9 的交付容差。
 - 插值参数 `u = (t - t_i) / (t_{i+1} - t_i)` 由整数纳秒精确计算，
   历元级时间戳（~1.7e18 ns）不损失精度。
+- 启用外推时，先由端点相邻样本求相对旋转 `r = q0^{-1} q1`（半角
+  θ < 90°），再按 `q(t) = q0 · r^u` 延长同一大圆：首端
+  `u = -(t0 - t) / (t1 - t0)`，末端 `u = 1 + (t - t_n) / (t_n - t_{n-1})`。
+  幂次直接由相对旋转的矢量部构造（`sin(uθ)/sinθ`），即使支撑角极小、
+  外推倍数很大（如 1e-6 rad/100 ns 外推 100 µs）也不发生相消。
 
 ## 项目结构
 
